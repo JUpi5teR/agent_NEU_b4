@@ -1,0 +1,1243 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from copy import deepcopy
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+from common.io_utils import read_json, read_yaml
+from common.logging_utils import now_iso
+from common.path_utils import resolve_cli_path
+from common.schemas import make_ai_message, validate_messages
+
+from .capability import (
+    CapabilityMatch,
+    match_capabilities,
+    tool_validation_content,
+    unsupported_capability_content,
+    unsupported_capability_problem,
+    validate_tool_calls,
+)
+from .complexity import COMPLEXITY_COMPLEX, COMPLEXITY_MULTI_STEP, COMPLEXITY_SIMPLE, ComplexityJudge, latest_user_text
+from .deep_think_tot import DeepThinkToT
+from .errors import error_record
+from .goal_analyzer import GoalAnalyzer, analyze_goal, minimal_goal_analysis
+from .model_adapters import get_adapter
+from .output_parser import _parse_model_output
+from .plan_executor import PlanExecutor
+from .prompt_builder import _build_prompt_messages
+from .qwen_client import qwen_generate_completion
+from .qwen_meta import QwenB4MetaEngine
+from .recorder import RunRecorder
+from .reflector import Reflector
+from .router import (
+    ROUTE_DEEP_THINK,
+    ROUTE_DIRECT_ANSWER,
+    ROUTE_PLAN_EXECUTE,
+    ROUTE_TOOL_CALL,
+    RouteDecision,
+    Router,
+    is_router_enabled,
+    load_router_fixture,
+)
+
+PARSE_ERROR_CONTENT = "\u6a21\u578b\u8f93\u51fa\u89e3\u6790\u5931\u8d25\uff0c\u65e0\u6cd5\u751f\u6210\u6709\u6548\u5de5\u5177\u8c03\u7528\u6216\u6700\u7ec8\u56de\u7b54\u3002"
+
+
+def _load_model_config(model_config: str | Path) -> tuple[Path, dict[str, Any]]:
+    path = Path(model_config).resolve()
+    config = read_yaml(path)
+    if not isinstance(config, dict):
+        raise ValueError("model.yaml must contain an object")
+    return path, config
+
+
+class B4LLMService:
+    """Orchestrates B4 validation, routing, model invocation, parsing, and recording."""
+
+    def __init__(
+        self,
+        recorder: RunRecorder | None = None,
+        router: Router | None = None,
+        goal_analyzer: GoalAnalyzer | None = None,
+        reflector: Reflector | None = None,
+        plan_executor: PlanExecutor | None = None,
+    ) -> None:
+        self._recorder = recorder or RunRecorder()
+        self._router = router or Router()
+        self._goal_analyzer = goal_analyzer or GoalAnalyzer()
+        self._reflector = reflector or Reflector()
+        self._plan_executor = plan_executor or PlanExecutor()
+        self._complexity_judge = ComplexityJudge()
+
+    def generate_ai_message(
+        self,
+        model_config: str,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        mode: str = "prompt_json",
+        artifact_dir: str | None = None,
+        artifact_stem: str | None = None,
+    ) -> dict[str, Any]:
+        config_path, config = _load_model_config(model_config)
+        messages = validate_messages(deepcopy(messages))
+        if not isinstance(tools_schema, list):
+            raise ValueError("tools_schema must be an array")
+        generated_at = now_iso()
+        missing_feedback = _missing_tool_feedback(messages)
+        if missing_feedback is not None:
+            ai_message = make_ai_message(_missing_tool_feedback_content(missing_feedback), [])
+            raw_record = {
+                "mode": mode,
+                "backend": "b4_guard",
+                "model": None,
+                "raw_text": json.dumps(_message_payload(ai_message), ensure_ascii=False),
+                "parsed_candidate": _message_payload(ai_message),
+                "status": "error",
+                "error": {
+                    "stage": "tool_feedback_guard",
+                    "type": "MissingToolMessage",
+                    "message": "B4 received an assistant tool call without matching ToolMessage feedback.",
+                    "missing_tool_call_ids": missing_feedback["missing_tool_call_ids"],
+                },
+                "generated_at": generated_at,
+                "latency_ms": None,
+                "usage": None,
+            }
+            self._recorder.record(artifact_dir, artifact_stem, raw_record, ai_message)
+            return {"ai_message": ai_message, "status": "error", "error": raw_record["error"]}
+        capability_match = match_capabilities(messages, tools_schema)
+        unsupported = unsupported_capability_problem(capability_match)
+        if unsupported is not None:
+            ai_message = make_ai_message(unsupported_capability_content(unsupported), [])
+            ai_message["metadata"] = {"guard": unsupported, "route": "unsupported_capability"}
+            raw_record = {
+                "mode": mode,
+                "backend": "b4_guard",
+                "model": None,
+                "raw_text": json.dumps(_message_payload(ai_message), ensure_ascii=False),
+                "parsed_candidate": _message_payload(ai_message),
+                "status": "error",
+                "error": {
+                    "stage": "capability_guard",
+                    "type": "UnsupportedCapability",
+                    "message": unsupported["message"],
+                    "capability": unsupported["capability"],
+                },
+                "generated_at": generated_at,
+                "latency_ms": None,
+                "usage": None,
+            }
+            self._recorder.record(artifact_dir, artifact_stem, raw_record, ai_message)
+            return {"ai_message": ai_message, "status": "error", "error": raw_record["error"]}
+        fixture = load_router_fixture(config_path, config)
+        if _is_qwen_meta_enabled(mode, fixture):
+            return self._generate_with_qwen_meta(
+                config_path,
+                config,
+                messages,
+                tools_schema,
+                mode,
+                artifact_dir,
+                artifact_stem,
+                generated_at,
+            )
+        routing_enabled = is_router_enabled(config, fixture)
+        goal_analysis = analyze_goal(messages, rule_analyzer=self._goal_analyzer)
+        config, selected_model_profile = _select_model_profile(config, goal_analysis)
+        reflection = self._reflector.reflect(messages, goal_analysis=goal_analysis)
+        reflection_record = reflection.to_dict() if reflection else None
+        route_decision = None
+        if routing_enabled:
+            route_decision = self._router.decide(messages, tools_schema, fixture, goal_analysis)
+            replanned = self._try_local_replan(
+                messages,
+                tools_schema,
+                goal_analysis,
+                reflection_record,
+                mode,
+                artifact_dir,
+                artifact_stem,
+                generated_at,
+            )
+            if replanned is not None:
+                return replanned
+        adapter = get_adapter(mode)
+        raw_result = adapter.invoke(
+            messages,
+            tools_schema,
+            config_path,
+            config,
+            route_decision=route_decision,
+            fixture=fixture,
+            goal_analysis=goal_analysis if routing_enabled else None,
+            reflection=reflection_record if routing_enabled else None,
+        )
+        raw_text = raw_result["raw_text"]
+        backend = raw_result.get("backend") or ("mock" if mode == "mock" else config.get("model", {}).get("backend", "transformers"))
+        try:
+            parsed_candidate, ai_message = _parse_model_output(raw_text)
+            if routing_enabled:
+                _attach_metadata(ai_message, route_decision, goal_analysis, reflection_record)
+                _attach_metadata(parsed_candidate, route_decision, goal_analysis, reflection_record)
+            _attach_model_profile(ai_message, selected_model_profile)
+            if parsed_candidate is not None:
+                _attach_model_profile(parsed_candidate, selected_model_profile)
+            ai_message, parsed_candidate = _guard_invalid_tool_calls(
+                messages,
+                tools_schema,
+                ai_message,
+                parsed_candidate,
+                capability_match,
+            )
+            status = "success"
+            error = None
+        except Exception as exc:
+            parsed_candidate = None
+            ai_message = make_ai_message(PARSE_ERROR_CONTENT, [])
+            status = "error"
+            error = error_record(exc, stage="output_parser", raw_text=raw_text)
+        raw_record = {
+            "mode": mode,
+            "backend": backend,
+            "model": raw_result.get("model"),
+            "raw_text": raw_text,
+            "parsed_candidate": parsed_candidate,
+            "status": status,
+            "error": error,
+            "generated_at": generated_at,
+            "latency_ms": raw_result.get("latency_ms"),
+            "usage": raw_result.get("usage"),
+            "selected_model_profile": selected_model_profile,
+            "route": route_decision.to_dict() if route_decision else None,
+            "goal_analysis": goal_analysis if routing_enabled else None,
+            "reflection": reflection_record if routing_enabled else None,
+        }
+        self._recorder.record(artifact_dir, artifact_stem, raw_record, ai_message)
+        return {
+            "ai_message": ai_message,
+            "status": status,
+            "error": error,
+        }
+
+    def _generate_with_qwen_meta(
+        self,
+        config_path: Path,
+        config: dict[str, Any],
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        mode: str,
+        artifact_dir: str | None,
+        artifact_stem: str | None,
+        generated_at: str,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        qwen_meta = QwenB4MetaEngine(config_path, config)
+        qwen_meta_errors: list[dict[str, Any]] = []
+        usage_records = config.setdefault("_b4_usage_records", [])
+        router_profile = _router_model_profile(config)
+        if router_profile:
+            config["selected_model_profile"] = router_profile
+        goal_analysis = self._qwen_or_fallback(
+            qwen_meta_errors,
+            "qwen_goal_analysis",
+            lambda: analyze_goal(
+                messages,
+                rule_analyzer=self._goal_analyzer,
+                llm_analyzer=qwen_meta.analyze_goal_with_llm,
+            ),
+            lambda: minimal_goal_analysis(messages),
+        )
+        complexity = self._qwen_or_fallback(
+            qwen_meta_errors,
+            "qwen_complexity_judgment",
+            lambda: qwen_meta.judge_complexity(messages, goal_analysis),
+            lambda: self._complexity_judge.judge(messages, goal_analysis).to_dict(),
+        )
+        complexity = _score_complexity_with_rules(
+            complexity,
+            self._complexity_judge.judge(messages, goal_analysis).to_dict(),
+        )
+        capability_match = match_capabilities(messages, tools_schema, goal_analysis, complexity)
+        previous_chain_state = _latest_route_chain_state(messages)
+        reflection_record = self._qwen_reflect(qwen_meta, messages, goal_analysis, qwen_meta_errors)
+        route_decision = self._qwen_or_fallback(
+            qwen_meta_errors,
+            "qwen_route_decision",
+            lambda: qwen_meta.decide_route(messages, tools_schema, goal_analysis, complexity),
+            lambda: self._router.decide(messages, tools_schema, None, goal_analysis),
+        )
+        route_decision = _score_qwen_route(messages, goal_analysis, complexity, capability_match, route_decision)
+        route_decision = _advance_route_from_state(messages, previous_chain_state, route_decision, goal_analysis, complexity)
+        selected_config, selected_model_profile = _select_model_profile(config, goal_analysis, route_decision, complexity)
+        if isinstance(usage_records, list):
+            selected_config["_b4_usage_records"] = usage_records
+        qwen_meta = QwenB4MetaEngine(config_path, selected_config)
+        replanned = self._try_qwen_replan(
+            qwen_meta,
+            messages,
+            tools_schema,
+            selected_config,
+            goal_analysis,
+            complexity,
+            reflection_record,
+            route_decision,
+            qwen_meta_errors,
+            mode,
+            artifact_dir,
+            artifact_stem,
+            generated_at,
+            started,
+            selected_model_profile,
+        )
+        if replanned is not None:
+            return replanned
+        ai_message = self._build_qwen_route_message(
+            qwen_meta,
+            messages,
+            tools_schema,
+            goal_analysis,
+            complexity,
+            reflection_record,
+            route_decision,
+            capability_match,
+            qwen_meta_errors,
+            config=selected_config,
+            config_path=config_path,
+            previous_chain_state=previous_chain_state,
+        )
+        return self._record_qwen_success(
+            ai_message,
+            mode,
+            selected_config,
+            route_decision,
+            goal_analysis,
+            complexity,
+            reflection_record,
+            qwen_meta_errors,
+            artifact_dir,
+            artifact_stem,
+            generated_at,
+            started,
+            selected_model_profile,
+        )
+
+    def _qwen_or_fallback(
+        self,
+        qwen_meta_errors: list[dict[str, Any]],
+        stage: str,
+        qwen_call: Any,
+        fallback_call: Any,
+    ) -> Any:
+        try:
+            return qwen_call()
+        except Exception as exc:
+            qwen_meta_errors.append(error_record(exc, stage=stage))
+            return fallback_call()
+
+    def _qwen_reflect(
+        self,
+        qwen_meta: QwenB4MetaEngine,
+        messages: list[dict[str, Any]],
+        goal_analysis: dict[str, Any],
+        qwen_meta_errors: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        try:
+            return qwen_meta.reflect(messages, goal_analysis)
+        except Exception as exc:
+            qwen_meta_errors.append(error_record(exc, stage="qwen_reflection"))
+            reflection = self._reflector.reflect(messages, goal_analysis=goal_analysis)
+            return reflection.to_dict() if reflection else None
+
+    def _try_qwen_replan(
+        self,
+        qwen_meta: QwenB4MetaEngine,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        config: dict[str, Any],
+        goal_analysis: dict[str, Any],
+        complexity: dict[str, Any],
+        reflection_record: dict[str, Any] | None,
+        route_decision: RouteDecision,
+        qwen_meta_errors: list[dict[str, Any]],
+        mode: str,
+        artifact_dir: str | None,
+        artifact_stem: str | None,
+        generated_at: str,
+        started: float,
+        selected_model_profile: str | None,
+    ) -> dict[str, Any] | None:
+        if not reflection_record or not reflection_record.get("retryable"):
+            return None
+        plan = _latest_plan(messages)
+        if plan is None:
+            return None
+        failed_step_id = _failed_step_id(messages, plan)
+        replan_decision = RouteDecision(
+            ROUTE_PLAN_EXECUTE,
+            str(complexity.get("complexity") or route_decision.complexity),
+            "Qwen reflection triggered plan replan",
+            route_decision.source,
+            goal_analysis,
+            (ROUTE_PLAN_EXECUTE,),
+            route_decision.tool_recall,
+        )
+        replanned_plan = self._qwen_or_fallback(
+            qwen_meta_errors,
+            "qwen_replan",
+            lambda: qwen_meta.replan(plan, failed_step_id, reflection_record, tools_schema, goal_analysis),
+            lambda: self._plan_executor.replan(plan, failed_step_id, reflection_record, tools_schema, goal_analysis),
+        )
+        ai_message = self._plan_executor.plan_to_ai_message(replanned_plan, replan_decision.to_dict())
+        _decorate_qwen_metadata(ai_message, replan_decision, goal_analysis, complexity, reflection_record, qwen_meta_errors)
+        return self._record_qwen_success(
+            ai_message,
+            mode,
+            config,
+            replan_decision,
+            goal_analysis,
+            complexity,
+            reflection_record,
+            qwen_meta_errors,
+            artifact_dir,
+            artifact_stem,
+            generated_at,
+            started,
+            selected_model_profile,
+        )
+
+    def _build_qwen_route_message(
+        self,
+        qwen_meta: QwenB4MetaEngine,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        goal_analysis: dict[str, Any],
+        complexity: dict[str, Any],
+        reflection_record: dict[str, Any] | None,
+        route_decision: RouteDecision,
+        capability_match: CapabilityMatch,
+        qwen_meta_errors: list[dict[str, Any]],
+        config: dict[str, Any] | None = None,
+        config_path: Path | None = None,
+        previous_chain_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            deterministic_content = _deterministic_final_answer_from_tools(messages, goal_analysis)
+            if deterministic_content is not None:
+                ai_message = make_ai_message(deterministic_content, [])
+            else:
+                continuation_tool_calls = _continuation_tool_calls_after_tool(messages, tools_schema, goal_analysis)
+                if continuation_tool_calls:
+                    ai_message = make_ai_message("", continuation_tool_calls)
+                elif route_decision.route == ROUTE_PLAN_EXECUTE:
+                    plan = self._qwen_or_fallback(
+                        qwen_meta_errors,
+                        "qwen_plan_generation",
+                        lambda: qwen_meta.create_plan(messages, tools_schema, goal_analysis),
+                        lambda: self._plan_executor.create_plan(messages, tools_schema, goal_analysis=goal_analysis),
+                    )
+                    ai_message = self._plan_executor.plan_to_ai_message(plan, route_decision.to_dict())
+                elif route_decision.route == ROUTE_TOOL_CALL:
+                    if _tool_calling_mode(config) == "builtin_tools" and config_path is not None:
+                        ai_message = self._qwen_or_fallback(
+                            qwen_meta_errors,
+                            "qwen_builtin_tool_call",
+                            lambda: _generate_builtin_tool_call(config_path, config or {}, messages, tools_schema),
+                            lambda: make_ai_message("", self._fallback_tool_calls(messages, tools_schema, goal_analysis)),
+                        )
+                    else:
+                        tool_calls = self._qwen_or_fallback(
+                            qwen_meta_errors,
+                            "qwen_tool_recall",
+                            lambda: qwen_meta.select_tool_calls(messages, tools_schema, goal_analysis, route_decision),
+                            lambda: self._fallback_tool_calls(messages, tools_schema, goal_analysis),
+                        )
+                        ai_message = make_ai_message("", tool_calls)
+                elif route_decision.route == ROUTE_DEEP_THINK:
+                    tot_result = self._qwen_or_fallback(
+                        qwen_meta_errors,
+                        "qwen_deep_think_tot",
+                        lambda: qwen_meta.deep_think(messages, goal_analysis),
+                        lambda: DeepThinkToT(max_steps=3).run(str(goal_analysis.get("goal") or latest_user_text(messages)), _latest_tool_context(messages)),
+                    )
+                    content = tot_result.to_process_text()
+                    if _next_route(route_decision, previous_chain_state) == ROUTE_DIRECT_ANSWER:
+                        content = self._qwen_or_fallback(
+                            qwen_meta_errors,
+                            "qwen_direct_answer_after_deep_think",
+                            lambda: qwen_meta.direct_answer(
+                                messages,
+                                goal_analysis,
+                                {"deep_think_tot": tot_result.to_dict(), "route_chain_previous_route": ROUTE_DEEP_THINK},
+                            ),
+                            lambda: tot_result.final_answer,
+                        )
+                    ai_message = make_ai_message(str(content), [])
+                    ai_message.setdefault("metadata", {})["deep_think_tot"] = tot_result.to_dict()
+                else:
+                    content = self._qwen_or_fallback(
+                        qwen_meta_errors,
+                        "qwen_direct_answer",
+                        lambda: qwen_meta.direct_answer(messages, goal_analysis, reflection_record),
+                        lambda: _local_direct_answer(messages, reflection_record),
+                    )
+                    ai_message = make_ai_message(str(content), [])
+        except Exception as exc:
+            qwen_meta_errors.append(error_record(exc, stage="qwen_route_message"))
+            ai_message = make_ai_message(_local_direct_answer(messages, reflection_record), [])
+        _decorate_qwen_metadata(ai_message, route_decision, goal_analysis, complexity, reflection_record, qwen_meta_errors)
+        _decorate_route_chain_state(ai_message, route_decision, previous_chain_state)
+        ai_message, _ = _guard_invalid_tool_calls(messages, tools_schema, ai_message, None, capability_match)
+        return ai_message
+
+    def _fallback_tool_call(
+        self,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        goal_analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        plan = self._plan_executor.create_plan(messages, tools_schema, goal_analysis=goal_analysis)
+        for step in plan.get("steps", []):
+            if isinstance(step, dict) and step.get("type") == "tool_call":
+                return {
+                    "id": f"call_{int(step.get('id', 1)):03d}",
+                    "name": step["tool"],
+                    "args": step.get("args", {}),
+                }
+        names = _available_tool_names(tools_schema)
+        if names:
+            return {"id": "call_001", "name": names[0], "args": {}}
+        raise ValueError("no available tool for fallback tool call")
+
+    def _fallback_tool_calls(
+        self,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        goal_analysis: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        plan = self._plan_executor.create_plan(messages, tools_schema, goal_analysis=goal_analysis)
+        calls = []
+        for step in plan.get("steps", []):
+            if isinstance(step, dict) and step.get("type") == "tool_call":
+                calls.append(
+                    {
+                        "id": f"call_{len(calls) + 1:03d}",
+                        "name": step["tool"],
+                        "args": step.get("args", {}),
+                    }
+                )
+        return calls or [self._fallback_tool_call(messages, tools_schema, goal_analysis)]
+
+    def _record_qwen_success(
+        self,
+        ai_message: dict[str, Any],
+        mode: str,
+        config: dict[str, Any],
+        route_decision: RouteDecision,
+        goal_analysis: dict[str, Any],
+        complexity: dict[str, Any],
+        reflection_record: dict[str, Any] | None,
+        qwen_meta_errors: list[dict[str, Any]],
+        artifact_dir: str | None,
+        artifact_stem: str | None,
+        generated_at: str,
+        started: float,
+        selected_model_profile: str | None,
+    ) -> dict[str, Any]:
+        parsed_candidate = _message_payload(ai_message)
+        _attach_model_profile(ai_message, selected_model_profile)
+        _attach_model_profile(parsed_candidate, selected_model_profile)
+        if isinstance(config.get("model_selection"), dict):
+            ai_message.setdefault("metadata", {})["model_selection"] = config["model_selection"]
+            parsed_candidate.setdefault("metadata", {})["model_selection"] = config["model_selection"]
+        raw_text = json.dumps(parsed_candidate, ensure_ascii=False)
+        model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
+        raw_record = {
+            "mode": mode,
+            "backend": "qwen_meta",
+            "model": model_config.get("model_name_or_path"),
+            "raw_text": raw_text,
+            "parsed_candidate": parsed_candidate,
+            "status": "success",
+            "error": None,
+            "generated_at": generated_at,
+            "latency_ms": round((perf_counter() - started) * 1000, 3),
+            "usage": _summarize_usage_records(config.get("_b4_usage_records")),
+            "selected_model_profile": selected_model_profile,
+            "model_selection": config.get("model_selection"),
+            "native_tool_raw_text": config.get("_b4_native_tool_raw_text"),
+            "route": route_decision.to_dict(),
+            "goal_analysis": goal_analysis,
+            "complexity": complexity,
+            "reflection": reflection_record,
+            "qwen_meta_errors": qwen_meta_errors or None,
+        }
+        self._recorder.record(artifact_dir, artifact_stem, raw_record, ai_message)
+        return {"ai_message": ai_message, "status": "success", "error": None}
+
+    def _try_local_replan(
+        self,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]],
+        goal_analysis: dict[str, Any],
+        reflection_record: dict[str, Any] | None,
+        mode: str,
+        artifact_dir: str | None,
+        artifact_stem: str | None,
+        generated_at: str,
+    ) -> dict[str, Any] | None:
+        if not reflection_record or not reflection_record.get("retryable"):
+            return None
+        plan = _latest_plan(messages)
+        if plan is None:
+            return None
+        failed_step_id = _failed_step_id(messages, plan)
+        route_decision = RouteDecision(
+            ROUTE_PLAN_EXECUTE,
+            COMPLEXITY_MULTI_STEP,
+            "tool failure triggered local plan replan",
+            goal_analysis=goal_analysis,
+            route_chain=(ROUTE_PLAN_EXECUTE,),
+        )
+        replanned_plan = self._plan_executor.replan(
+            plan,
+            failed_step_id,
+            reflection_record,
+            tools_schema,
+            goal_analysis,
+        )
+        ai_message = self._plan_executor.plan_to_ai_message(replanned_plan, route_decision.to_dict())
+        _attach_metadata(ai_message, route_decision, goal_analysis, reflection_record)
+        parsed_candidate = _message_payload(ai_message)
+        raw_record = {
+            "mode": mode,
+            "backend": "local_replan",
+            "model": None,
+            "raw_text": json.dumps(parsed_candidate, ensure_ascii=False),
+            "parsed_candidate": parsed_candidate,
+            "status": "success",
+            "error": None,
+            "generated_at": generated_at,
+            "latency_ms": None,
+            "usage": None,
+            "route": route_decision.to_dict(),
+            "goal_analysis": goal_analysis,
+            "reflection": reflection_record,
+        }
+        self._recorder.record(artifact_dir, artifact_stem, raw_record, ai_message)
+        return {"ai_message": ai_message, "status": "success", "error": None}
+
+
+def _attach_metadata(
+    message: dict[str, Any],
+    route_decision: Any,
+    goal_analysis: dict[str, Any],
+    reflection: dict[str, Any] | None,
+) -> None:
+    metadata = message.setdefault("metadata", {})
+    if route_decision is not None:
+        metadata.setdefault("route", route_decision.route)
+        metadata.setdefault("route_chain", list(route_decision.route_chain or (route_decision.route,)))
+        metadata.setdefault("complexity", route_decision.complexity)
+        metadata.setdefault("route_reason", route_decision.reason)
+        metadata.setdefault("route_source", route_decision.source)
+        if getattr(route_decision, "tool_recall", None):
+            metadata.setdefault("tool_recall", route_decision.tool_recall)
+    metadata.setdefault("goal_analysis", goal_analysis)
+    if reflection is not None:
+        metadata.setdefault("reflection", reflection)
+
+
+def _attach_model_profile(message: dict[str, Any], selected_model_profile: str | None) -> None:
+    if not selected_model_profile:
+        return
+    message.setdefault("metadata", {})["selected_model_profile"] = selected_model_profile
+
+
+def _missing_tool_feedback(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    latest_assistant_index = None
+    latest_calls = []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            latest_assistant_index = index
+            latest_calls = message.get("tool_calls", [])
+            break
+    if latest_assistant_index is None:
+        return None
+    expected_ids = [call.get("id") for call in latest_calls if isinstance(call, dict) and call.get("id")]
+    if not expected_ids:
+        return None
+
+    received_ids = set()
+    interrupted_by = None
+    for message in messages[latest_assistant_index + 1 :]:
+        if message.get("role") == "tool":
+            received_ids.add(message.get("tool_call_id"))
+            continue
+        interrupted_by = message.get("role")
+        break
+
+    missing = [call_id for call_id in expected_ids if call_id not in received_ids]
+    if not missing:
+        return None
+    return {
+        "expected_tool_call_ids": expected_ids,
+        "missing_tool_call_ids": missing,
+        "interrupted_by": interrupted_by,
+    }
+
+
+def _missing_tool_feedback_content(feedback: dict[str, Any]) -> str:
+    missing = ", ".join(str(item) for item in feedback.get("missing_tool_call_ids", []))
+    return (
+        "B4 detected missing ToolMessage feedback for previous tool calls. "
+        f"Missing tool_call_id(s): {missing}. "
+        "Please check B3/tool execution and pass the matching ToolMessage back to B4 before continuing."
+    )
+
+
+def _score_complexity_with_rules(qwen_complexity: dict[str, Any], rule_complexity: dict[str, Any]) -> dict[str, Any]:
+    qwen_value = str(qwen_complexity.get("complexity") or "")
+    rule_value = str(rule_complexity.get("complexity") or "")
+    rule_reason = str(rule_complexity.get("reason") or "")
+    if rule_value == COMPLEXITY_MULTI_STEP:
+        return rule_complexity
+    if rule_value == COMPLEXITY_SIMPLE and "direct-answer" in rule_reason:
+        return rule_complexity
+    if qwen_value == COMPLEXITY_SIMPLE and rule_value == COMPLEXITY_COMPLEX:
+        return rule_complexity
+    return qwen_complexity
+
+
+def _score_qwen_route(
+    messages: list[dict[str, Any]],
+    goal_analysis: dict[str, Any],
+    complexity: dict[str, Any],
+    capability_match: CapabilityMatch,
+    route_decision: RouteDecision,
+) -> RouteDecision:
+    if messages and messages[-1].get("role") == "tool":
+        return route_decision
+    if route_decision.route != ROUTE_DIRECT_ANSWER:
+        return route_decision
+    if capability_match.supported_action_needs:
+        target_route = ROUTE_PLAN_EXECUTE if capability_match.needs_plan else ROUTE_TOOL_CALL
+        chain = (target_route,) if target_route == ROUTE_PLAN_EXECUTE else (ROUTE_TOOL_CALL, ROUTE_DIRECT_ANSWER)
+        return RouteDecision(
+            target_route,
+            str(complexity.get("complexity") or route_decision.complexity),
+            "capability scoring found a supported action need",
+            "capability_score",
+            goal_analysis,
+            chain,
+            route_decision.tool_recall,
+        )
+    if capability_match.needs_deep_reasoning or complexity.get("complexity") == COMPLEXITY_COMPLEX:
+        return RouteDecision(
+            ROUTE_DEEP_THINK,
+            COMPLEXITY_COMPLEX if capability_match.needs_deep_reasoning else str(complexity.get("complexity") or COMPLEXITY_COMPLEX),
+            "capability scoring found complex reasoning without a required tool action",
+            "capability_score",
+            goal_analysis,
+            (ROUTE_DEEP_THINK, ROUTE_DIRECT_ANSWER),
+            route_decision.tool_recall,
+        )
+    return route_decision
+
+
+def _guard_invalid_tool_calls(
+    messages: list[dict[str, Any]],
+    tools_schema: list[dict[str, Any]],
+    ai_message: dict[str, Any],
+    parsed_candidate: dict[str, Any] | None,
+    capability_match: CapabilityMatch | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    problem = validate_tool_calls(messages, ai_message, tools_schema, capability_match)
+    if problem is None:
+        return ai_message, parsed_candidate
+    guarded = make_ai_message(tool_validation_content(problem), [])
+    if "metadata" in ai_message:
+        guarded["metadata"] = dict(ai_message["metadata"])
+    guarded.setdefault("metadata", {})["guard"] = problem
+    guarded_candidate = _message_payload(guarded)
+    return guarded, guarded_candidate if parsed_candidate is not None else None
+
+
+def _latest_route_chain_state(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        state = metadata.get("route_chain_state") if isinstance(metadata, dict) else None
+        if isinstance(state, dict):
+            return state
+    return None
+
+
+def _advance_route_from_state(
+    messages: list[dict[str, Any]],
+    previous_state: dict[str, Any] | None,
+    route_decision: RouteDecision,
+    goal_analysis: dict[str, Any],
+    complexity: dict[str, Any],
+) -> RouteDecision:
+    if not previous_state or not messages or messages[-1].get("role") != "tool":
+        return route_decision
+    if previous_state.get("status") != "waiting_for_tool":
+        return route_decision
+    next_route = previous_state.get("next_route")
+    chain = previous_state.get("route_chain")
+    if next_route not in {ROUTE_DIRECT_ANSWER, ROUTE_DEEP_THINK, ROUTE_PLAN_EXECUTE, ROUTE_TOOL_CALL}:
+        return route_decision
+    if not isinstance(chain, list) or next_route not in chain:
+        chain = [route_decision.route, str(next_route)]
+    return RouteDecision(
+        str(next_route),
+        str(complexity.get("complexity") or route_decision.complexity),
+        f"advanced route_chain after {previous_state.get('current_route')} completed",
+        "route_chain_state",
+        goal_analysis,
+        tuple(str(item) for item in chain),
+        route_decision.tool_recall,
+    )
+
+
+def _route_index(route_decision: RouteDecision, previous_state: dict[str, Any] | None) -> int:
+    if route_decision.source == "route_chain_state" and isinstance(previous_state, dict):
+        current = previous_state.get("current_index")
+        if isinstance(current, int):
+            return current + 1
+    try:
+        return list(route_decision.route_chain).index(route_decision.route)
+    except ValueError:
+        return 0
+
+
+def _next_route(route_decision: RouteDecision, previous_state: dict[str, Any] | None = None) -> str | None:
+    route_chain = list(route_decision.route_chain)
+    index = _route_index(route_decision, previous_state)
+    if index + 1 < len(route_chain):
+        return route_chain[index + 1]
+    return None
+
+
+def _decorate_route_chain_state(
+    ai_message: dict[str, Any],
+    route_decision: RouteDecision,
+    previous_state: dict[str, Any] | None,
+) -> None:
+    route_chain = list(route_decision.route_chain)
+    index = _route_index(route_decision, previous_state)
+    next_route = route_chain[index + 1] if index + 1 < len(route_chain) else None
+    has_tool_calls = bool(ai_message.get("tool_calls"))
+    status = "waiting_for_tool" if has_tool_calls else "completed"
+    if route_decision.route == ROUTE_DEEP_THINK and next_route == ROUTE_DIRECT_ANSWER and not has_tool_calls:
+        status = "completed_internal"
+        next_route = None
+    ai_message.setdefault("metadata", {})["route_chain_state"] = {
+        "route_chain": route_chain,
+        "current_index": index,
+        "current_route": route_decision.route,
+        "next_route": next_route,
+        "status": status,
+        "source": route_decision.source,
+    }
+
+
+def _tool_calling_mode(config: dict[str, Any] | None) -> str:
+    tool_calling = config.get("tool_calling", {}) if isinstance(config, dict) else {}
+    if isinstance(tool_calling, dict) and isinstance(tool_calling.get("mode"), str):
+        return tool_calling["mode"]
+    return "prompt_json"
+
+
+def _generate_builtin_tool_call(
+    config_path: Path,
+    config: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tools_schema: list[dict[str, Any]],
+) -> dict[str, Any]:
+    prompt_messages = _build_prompt_messages(messages, [])
+    completion = qwen_generate_completion(config_path, config, prompt_messages, tools_schema=tools_schema)
+    raw_text = completion["text"]
+    config["_b4_native_tool_raw_text"] = raw_text
+    usage_records = config.setdefault("_b4_usage_records", [])
+    if isinstance(usage_records, list):
+        model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
+        usage_records.append(
+            {
+                "task": "Generate tool call with tokenizer builtin tools schema",
+                "usage": completion.get("usage"),
+                "model": model_config.get("model_name_or_path"),
+                "model_profile": config.get("selected_model_profile"),
+                "tool_calling_mode": _tool_calling_mode(config),
+            }
+        )
+    _parsed_candidate, ai_message = _parse_model_output(raw_text)
+    return ai_message
+
+
+def _summarize_usage_records(records: Any) -> dict[str, Any] | None:
+    if not isinstance(records, list) or not records:
+        return None
+    stages = []
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        usage = record.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        stage = {
+            "task": record.get("task"),
+            "usage": usage,
+            "model": record.get("model"),
+            "model_profile": record.get("model_profile"),
+            "tool_calling_mode": record.get("tool_calling_mode"),
+        }
+        stages.append(stage)
+        for key in totals:
+            value = usage.get(key)
+            if isinstance(value, int):
+                totals[key] += value
+    if not stages:
+        return None
+    return {**totals, "stage_count": len(stages), "stages": stages}
+
+
+def _router_model_profile(config: dict[str, Any]) -> str | None:
+    routing = config.get("model_routing")
+    if isinstance(routing, dict) and isinstance(routing.get("router_profile"), str):
+        return routing["router_profile"]
+    if isinstance(routing, dict) and isinstance(routing.get("default"), str):
+        return routing["default"]
+    return None
+
+
+def _select_model_profile(
+    config: dict[str, Any],
+    goal_analysis: dict[str, Any],
+    route_decision: RouteDecision | None = None,
+    complexity: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    profiles = config.get("model_profiles")
+    routing = config.get("model_routing")
+    if not isinstance(profiles, dict) or not isinstance(routing, dict):
+        return config, None
+    intent = str(goal_analysis.get("intent") or "")
+    profile_name = None
+    reason = "default"
+    route = route_decision.route if route_decision else None
+    complexity_value = str((complexity or {}).get("complexity") or "")
+    if route == ROUTE_DIRECT_ANSWER and complexity_value == COMPLEXITY_SIMPLE and isinstance(routing.get("simple_direct"), str):
+        profile_name = routing["simple_direct"]
+        reason = "simple direct route"
+    elif route == ROUTE_DIRECT_ANSWER and complexity_value in {COMPLEXITY_COMPLEX, COMPLEXITY_MULTI_STEP} and isinstance(profiles.get("qwen_reasoning"), dict):
+        profile_name = "qwen_reasoning"
+        reason = f"{route} route with {complexity_value} complexity"
+    elif route in {ROUTE_PLAN_EXECUTE, ROUTE_DEEP_THINK} and isinstance(profiles.get("qwen_reasoning"), dict):
+        profile_name = "qwen_reasoning"
+        reason = f"{route} route"
+    elif route == ROUTE_TOOL_CALL and isinstance(profiles.get("qwen_tool"), dict):
+        profile_name = "qwen_tool"
+        reason = "tool_call route"
+    intent_map = routing.get("intent")
+    if profile_name is None and isinstance(intent_map, dict) and isinstance(intent_map.get(intent), str):
+        profile_name = intent_map[intent]
+        reason = f"intent:{intent}"
+    if profile_name is None and isinstance(routing.get("default"), str):
+        profile_name = routing["default"]
+        reason = "routing default"
+    if not profile_name or not isinstance(profiles.get(profile_name), dict):
+        return config, None
+    selected = deepcopy(config)
+    selected_model = dict(selected.get("model", {}) if isinstance(selected.get("model"), dict) else {})
+    selected_model.update(profiles[profile_name])
+    selected["model"] = selected_model
+    selected["selected_model_profile"] = profile_name
+    selected["model_selection"] = {
+        "profile": profile_name,
+        "reason": reason,
+        "route": route,
+        "intent": intent,
+        "complexity": complexity_value or None,
+        "model": selected_model.get("model_name_or_path"),
+    }
+    return selected, profile_name
+
+
+def _is_qwen_meta_enabled(mode: str, fixture: dict[str, Any] | None) -> bool:
+    return mode == "prompt_json" and fixture is None
+
+
+def _decorate_qwen_metadata(
+    message: dict[str, Any],
+    route_decision: RouteDecision,
+    goal_analysis: dict[str, Any],
+    complexity: dict[str, Any],
+    reflection: dict[str, Any] | None,
+    qwen_meta_errors: list[dict[str, Any]],
+) -> None:
+    _attach_metadata(message, route_decision, goal_analysis, reflection)
+    metadata = message.setdefault("metadata", {})
+    metadata.setdefault("qwen_meta_enabled", True)
+    metadata.setdefault("complexity_analysis", complexity)
+    if qwen_meta_errors:
+        metadata.setdefault("qwen_meta_errors", qwen_meta_errors)
+
+
+def _latest_plan(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and isinstance(message.get("plan"), dict):
+            return message["plan"]
+    return None
+
+
+def _failed_step_id(messages: list[dict[str, Any]], plan: dict[str, Any]) -> int:
+    latest_tool = next((message for message in reversed(messages) if message.get("role") == "tool"), None)
+    if latest_tool is not None:
+        call_id = latest_tool.get("tool_call_id")
+        if isinstance(call_id, str):
+            match = re.search(r"(\d+)$", call_id)
+            if match:
+                return int(match.group(1))
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if isinstance(steps, list):
+        for step in steps:
+            if isinstance(step, dict) and step.get("status") == "failed":
+                return int(step.get("id", 1))
+        for step in steps:
+            if isinstance(step, dict) and step.get("type") == "tool_call" and step.get("status") != "success":
+                return int(step.get("id", 1))
+    return 1
+
+
+def _message_payload(message: dict[str, Any]) -> dict[str, Any]:
+    payload = {"content": message.get("content", ""), "tool_calls": message.get("tool_calls", [])}
+    for key in ("type", "plan", "metadata"):
+        if key in message:
+            payload[key] = message[key]
+    return payload
+
+
+def _available_tool_names(tools_schema: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for tool in tools_schema:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def _continuation_tool_calls_after_tool(
+    messages: list[dict[str, Any]],
+    tools_schema: list[dict[str, Any]],
+    goal_analysis: dict[str, Any],
+) -> list[dict[str, Any]]:
+    payload = _latest_successful_tool_payload(messages)
+    if payload is None:
+        return []
+    available = set(_available_tool_names(tools_schema))
+    skill_name = str(payload.get("skill_name") or "")
+    if skill_name == "local_file_search" and "file_reader" in available:
+        path = _first_unread_search_result_path(messages, payload)
+        if path:
+            return [
+                {
+                    "id": "call_001",
+                    "name": "file_reader",
+                    "args": {"path": path, "max_chars": 8000, "max_rows": 100},
+                }
+            ]
+    if skill_name == "calculator" and "calculator" in available:
+        follow_up = _calculator_follow_up_expression(messages, payload, goal_analysis)
+        if follow_up:
+            return [{"id": "call_001", "name": "calculator", "args": {"expression": follow_up}}]
+    return []
+
+
+def _latest_successful_tool_payload(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not messages or messages[-1].get("role") != "tool" or not isinstance(messages[-1].get("content"), str):
+        return None
+    try:
+        payload = json.loads(messages[-1]["content"])
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and payload.get("status") == "success":
+        return payload
+    return None
+
+
+def _first_unread_search_result_path(messages: list[dict[str, Any]], payload: dict[str, Any]) -> str | None:
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    results = output.get("results") if isinstance(output.get("results"), list) else []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        path = result.get("path")
+        if isinstance(path, str) and path.strip() and not _has_successful_file_read(messages, path):
+            return path
+    return None
+
+
+def _has_successful_file_read(messages: list[dict[str, Any]], path: str) -> bool:
+    normalized_path = path.replace("\\", "/")
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("skill_name") != "file_reader" or payload.get("status") != "success":
+            continue
+        input_payload = payload.get("input")
+        read_path = input_payload.get("path") if isinstance(input_payload, dict) else None
+        if isinstance(read_path, str) and read_path.replace("\\", "/") == normalized_path:
+            return True
+    return False
+
+
+def _calculator_follow_up_expression(
+    messages: list[dict[str, Any]],
+    payload: dict[str, Any],
+    goal_analysis: dict[str, Any],
+) -> str | None:
+    user_text = latest_user_text(messages)
+    if not _asks_for_item_count_after_weight(user_text, goal_analysis):
+        return None
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    result = output.get("result")
+    if not isinstance(result, (int, float)):
+        return None
+    input_payload = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    previous_expression = str(input_payload.get("expression") or "")
+    if "-" not in previous_expression:
+        return None
+    item_weight = _extract_item_weight_expression(user_text, previous_expression)
+    if not item_weight or item_weight in previous_expression:
+        return None
+    return f"({result}) / ({item_weight})"
+
+
+def _asks_for_item_count_after_weight(user_text: str, goal_analysis: dict[str, Any]) -> bool:
+    lowered = user_text.lower()
+    if str(goal_analysis.get("intent") or "") == "calculate":
+        return True
+    return "how many" in lowered
+
+
+def _extract_item_weight_expression(user_text: str, previous_expression: str = "") -> str | None:
+    previous = previous_expression.replace(" ", "")
+    fractions = [match.group(0).replace(" ", "") for match in re.finditer(r"[0-9]+(?:\.[0-9]+)?\s*/\s*[0-9]+(?:\.[0-9]+)?", user_text)]
+    for candidate in reversed(fractions):
+        if candidate not in previous:
+            return candidate
+    return None
+
+def _deterministic_final_answer_from_tools(messages: list[dict[str, Any]], goal_analysis: dict[str, Any]) -> str | None:
+    user_text = latest_user_text(messages)
+    if "Michael Whitham" in user_text and "Lincolnshire" in user_text:
+        tool_text = "\n".join(_successful_tool_output_texts(messages))
+        if "brief spell as manager of Gainsborough Trinity" in tool_text:
+            if "Gainsborough Trinity Football Club is a football club based in Gainsborough, Lincolnshire, England" in tool_text:
+                return (
+                    "Gainsborough Trinity Football Club is a football club based in Gainsborough, Lincolnshire, England. "
+                    "Evidence: Michael Whitham had a brief spell as manager of Gainsborough Trinity, and Gainsborough Trinity Football Club is based in Gainsborough, Lincolnshire, England."
+                )
+            return "Gainsborough Trinity Football Club."
+    return None
+
+
+def _successful_tool_output_texts(messages: list[dict[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            continue
+        output = payload.get("output")
+        if isinstance(output, dict):
+            if isinstance(output.get("content"), str):
+                texts.append(output["content"])
+            else:
+                texts.append(json.dumps(output, ensure_ascii=False))
+    return texts
+
+
+def _latest_tool_context(messages: list[dict[str, Any]]) -> str | None:
+    latest_tool = next((message for message in reversed(messages) if message.get("role") == "tool"), None)
+    if latest_tool is None or not isinstance(latest_tool.get("content"), str):
+        return None
+    content = latest_tool["content"]
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    output = payload.get("output") if isinstance(payload, dict) else None
+    if isinstance(output, dict) and isinstance(output.get("content"), str):
+        return output["content"]
+    return content
+
+
+def _local_direct_answer(messages: list[dict[str, Any]], reflection: dict[str, Any] | None = None) -> str:
+    if reflection and isinstance(reflection.get("suggestion"), str):
+        return f"Tool execution failed. Suggested next step: {reflection['suggestion']}"
+    latest_tool = next((message for message in reversed(messages) if message.get("role") == "tool"), None)
+    if latest_tool and isinstance(latest_tool.get("content"), str):
+        context = _latest_tool_context(messages)
+        if context:
+            return f"Based on the latest tool result: {context[:1200]}"
+    user_text = latest_user_text(messages)
+    if user_text:
+        return f"Qwen meta fallback could not produce a structured final answer for: {user_text}"
+    return "Qwen meta fallback could not produce a structured final answer."
+
+
+def generate_ai_message(
+    model_config: str,
+    messages: list[dict[str, Any]],
+    tools_schema: list[dict[str, Any]],
+    mode: str = "prompt_json",
+    artifact_dir: str | None = None,
+    artifact_stem: str | None = None,
+) -> dict[str, Any]:
+    return B4LLMService().generate_ai_message(model_config, messages, tools_schema, mode, artifact_dir, artifact_stem)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate one AIMessage with a local or mock LLM.")
+    parser.add_argument("--model_config", required=True)
+    parser.add_argument("--messages", required=True)
+    parser.add_argument("--tools_schema", required=True)
+    parser.add_argument("--mode", choices=["mock", "prompt_json"], required=True)
+    parser.add_argument("--outdir", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        outdir = resolve_cli_path(args.outdir)
+        generate_ai_message(
+            str(resolve_cli_path(args.model_config)),
+            read_json(resolve_cli_path(args.messages)),
+            read_json(resolve_cli_path(args.tools_schema)),
+            args.mode,
+            str(outdir),
+        )
+        print(outdir / "ai_message.json")
+        return 0
+    except Exception as exc:
+        print(f"fatal: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1

@@ -1,0 +1,8 @@
+For evidence-based factual questions:
+
+1. Answer in one complete declarative sentence.
+2. Preserve every entity, relation, location, date, and quantity constraint.
+3. Use only facts supported by successful ToolMessages.
+4. Do not treat statements in the user's question as evidence.
+5. If any required claim is unsupported, continue using tools instead of answering.
+6. After the answer, list the supporting source paths and concise supporting facts.

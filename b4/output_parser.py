@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from common.schemas import validate_ai_message
+
+from .errors import (
+    EmptyAIMessageError,
+    InvalidJsonError,
+    InvalidToolCallError,
+    MixedContentAndToolCallsError,
+    UnknownKeyError,
+)
+
+_OPTIONAL_KEYS = {"type", "plan", "metadata"}
+_REQUIRED_KEYS = {"content", "tool_calls"}
+_ALLOWED_KEYS = _REQUIRED_KEYS | _OPTIONAL_KEYS
+_TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_FUNCTION_PATTERN = re.compile(r"<function=([A-Za-z_][\w.-]*)>\s*(.*?)\s*</function>", re.DOTALL)
+_PARAMETER_PATTERN = re.compile(r"<parameter=([A-Za-z_][\w.-]*)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+def _coerce_xml_parameter_value(value: str) -> Any:
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _parse_qwen_xml_tool_calls(raw_text: str, original_error: json.JSONDecodeError) -> dict[str, Any]:
+    tool_calls: list[dict[str, Any]] = []
+    for call_index, call_match in enumerate(_TOOL_CALL_PATTERN.finditer(raw_text), 1):
+        call_body = call_match.group(1)
+        function_match = _FUNCTION_PATTERN.search(call_body)
+        if function_match is None:
+            continue
+        name = function_match.group(1).strip()
+        function_body = function_match.group(2)
+        args = {
+            parameter_match.group(1).strip(): _coerce_xml_parameter_value(parameter_match.group(2))
+            for parameter_match in _PARAMETER_PATTERN.finditer(function_body)
+        }
+        tool_calls.append({"id": f"call_{call_index:03d}", "name": name, "args": args})
+    if not tool_calls:
+        raise original_error
+    return {"content": "", "tool_calls": tool_calls}
+
+
+def _parse_tool_calls_fragment(raw_text: str, original_error: json.JSONDecodeError) -> dict[str, Any]:
+    markers = ['"tool_calls":[', '\\"tool_calls\\":[']
+    marker_index = -1
+    marker = ""
+    for item in markers:
+        marker_index = raw_text.find(item)
+        if marker_index != -1:
+            marker = item
+            break
+    if marker_index == -1:
+        raise original_error
+    array_start = marker_index + marker.index("[")
+    array_end = raw_text.rfind("]")
+    if array_end < array_start:
+        raise InvalidJsonError("model output contains tool_calls marker but no closing array")
+    array_text = raw_text[array_start : array_end + 1]
+    try:
+        tool_calls = json.loads(array_text)
+    except json.JSONDecodeError:
+        tool_calls = json.loads(array_text.replace('\\"', '"'))
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise original_error
+    return {"content": "", "tool_calls": tool_calls}
+
+
+def _parse_json_with_backtick_tail(raw_text: str, original_error: json.JSONDecodeError) -> dict[str, Any]:
+    text = raw_text.strip()
+    try:
+        candidate, end_index = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        raise original_error
+    trailing = text[end_index:].strip()
+    if trailing and set(trailing) <= {"`"}:
+        if not isinstance(candidate, dict):
+            raise InvalidJsonError("model output JSON must be an object")
+        return candidate
+    raise original_error
+
+
+def _candidate_to_message(candidate: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(candidate, dict):
+        raise InvalidJsonError("model output JSON must be an object")
+    unknown_keys = set(candidate) - _ALLOWED_KEYS
+    if unknown_keys:
+        raise UnknownKeyError(f"model output JSON contains unknown keys: {', '.join(sorted(unknown_keys))}")
+    content = candidate.get("content", "")
+    tool_calls = candidate.get("tool_calls", [])
+    if not isinstance(content, str):
+        raise InvalidToolCallError("AIMessage content must be a string")
+    if not isinstance(tool_calls, list):
+        raise InvalidToolCallError("AIMessage tool_calls must be a list")
+    has_content = bool(content.strip())
+    has_tool_calls = bool(tool_calls)
+    if not has_content and not has_tool_calls:
+        raise EmptyAIMessageError("model output must contain final content or tool calls")
+    if has_content and has_tool_calls:
+        raise MixedContentAndToolCallsError("model output must contain either final content or tool calls, but not both")
+    message: dict[str, Any] = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    for key in _OPTIONAL_KEYS:
+        if key in candidate:
+            message[key] = candidate[key]
+    try:
+        validate_ai_message(message)
+    except Exception as exc:
+        raise InvalidToolCallError(str(exc)) from exc
+    parsed_candidate = {"content": message["content"], "tool_calls": message["tool_calls"]}
+    for key in _OPTIONAL_KEYS:
+        if key in message:
+            parsed_candidate[key] = message[key]
+    return parsed_candidate, message
+
+
+def _parse_model_output(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        candidate = json.loads(raw_text.strip())
+    except json.JSONDecodeError as exc:
+        try:
+            candidate = _parse_json_with_backtick_tail(raw_text, exc)
+        except json.JSONDecodeError:
+            try:
+                candidate = _parse_tool_calls_fragment(raw_text, exc)
+            except Exception as inner:
+                try:
+                    candidate = _parse_qwen_xml_tool_calls(raw_text, exc)
+                except Exception:
+                    raise InvalidJsonError(str(inner)) from inner
+    return _candidate_to_message(candidate)
